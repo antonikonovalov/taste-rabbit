@@ -5,12 +5,14 @@ import (
 	"github.com/streadway/amqp"
 	"net/http"
 	"strconv"
+	"sync"
 )
 
 var (
-	addr     = flag.String(`addr`, `:4567`, `listen address`)
-	users    = flag.Int(`users`, 100, `set your max users value and manager create rooms <=> users such length`)
-	rabbirmq = flag.String("rabbitmq", "amqp://guest:guest@localhost:5672/", "Host:Port to rabbitmq server")
+	addr        = flag.String(`addr`, `:4567`, `listen address`)
+	users       = flag.Int(`users`, 100, `set your max users value and manager create rooms <=> users such length`)
+	concurrency = flag.Int(`concurrency`, 100, `parallel create exs`)
+	rabbirmq    = flag.String("rabbitmq", "amqp://guest:guest@localhost:5672/", "Host:Port to rabbitmq server")
 )
 
 func main() {
@@ -22,9 +24,11 @@ func main() {
 	}
 	defer conn.Close()
 
-	if err = buildRelations(conn); err != nil {
+	println(`start build exs`)
+	if err = buildRelations(conn, *concurrency); err != nil {
 		panic(err)
 	}
+	println(`end build exs`)
 
 	http.HandleFunc(`/bind`, func(rw http.ResponseWriter, r *http.Request) {
 		ch, err := conn.Channel()
@@ -73,29 +77,66 @@ func main() {
 	panic(http.ListenAndServe(*addr, nil))
 }
 
-func buildRelations(conn *amqp.Connection) error {
-	ch, err := conn.Channel()
-	if err != nil {
-		return err
+func buildRelations(conn *amqp.Connection, parallel int) error {
+	pool := []*amqp.Channel{}
+	for i := 0; i < parallel; i++ {
+		ch, err := conn.Channel()
+		if err != nil {
+			panic(err)
+		}
+
+		pool = append(pool, ch)
 	}
-	defer ch.Close()
 
-	for i := 1; i <= *users; i++ {
-		id := strconv.Itoa(i)
-		err = ch.ExchangeDeclare(`U`+id, `fanout`, true, false, false, false, nil)
-		if err != nil {
-			return err
+	p := 0
+	lock := sync.Mutex{}
+	getChan := func() *amqp.Channel {
+		lock.Lock()
+		if p == parallel {
+			p = 0
 		}
+		ch := pool[p]
+		p++
+		lock.Unlock()
+		return ch
+	}
 
-		err = ch.ExchangeDeclare(`R`+id, `fanout`, true, false, false, false, nil)
-		if err != nil {
-			return err
-		}
+	for i := 1; i <= *users; i += parallel {
+		wg := &sync.WaitGroup{}
+		for c := 0; c < parallel; c++ {
+			wg.Add(1)
 
-		err = ch.ExchangeBind(`U`+id, ``, `R`+id, false, nil)
-		if err != nil {
-			return err
+			go func(j int) {
+				defer wg.Done()
+				id := strconv.Itoa(j)
+				sec := strconv.Itoa(j + 1)
+				ch := getChan()
+				err := ch.ExchangeDeclare(`U`+id, `fanout`, true, false, false, false, nil)
+				if err != nil {
+					panic(err)
+				}
+
+				err = ch.ExchangeDeclare(`U`+sec, `fanout`, true, false, false, false, nil)
+				if err != nil {
+					panic(err)
+				}
+
+				err = ch.ExchangeDeclare(`R`+id, `fanout`, true, false, false, false, nil)
+				if err != nil {
+					panic(err)
+				}
+
+				err = ch.ExchangeBind(`U`+id, ``, `R`+id, false, nil)
+				if err != nil {
+					panic(err)
+				}
+				err = ch.ExchangeBind(`U`+sec, ``, `R`+id, false, nil)
+				if err != nil {
+					panic(err)
+				}
+			}(i + c)
 		}
+		wg.Wait()
 	}
 	return nil
 }

@@ -42,7 +42,7 @@ func main() {
 			}
 			defer ch.Close()
 
-			queue, err := ch.QueueDeclare("", true, false, false, false, nil)
+			queue, err := ch.QueueDeclare("", false, false, false, false, nil)
 			if err != nil {
 				panic(err)
 			}
